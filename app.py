@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import httpx
 import streamlit as st
 
-st.set_page_config(page_title='Nusantara AI Lab v0.5.9', page_icon='🤖', layout='wide')
+st.set_page_config(page_title='Nusantara AI Lab v0.6.2', page_icon='🤖', layout='wide')
 BASE_URL = 'https://gen.pollinations.ai/v1'
 AGENTS = {
     'v0.1': {'name': 'Nusantara AI Assistant v0.1', 'model': 'community/myChair212/nusantara-assistant-v01'},
@@ -13,6 +13,133 @@ AGENTS = {
     'luna': {'name': 'GPT-5.6 Luna', 'model': 'openai/gpt-5.6-luna'},
     'mini': {'name': 'GPT-5.4 Mini', 'model': 'openai/gpt-5.4-mini'},
 }
+# The built-in list is a starting point; model IDs are checked through the API.
+# No unsupported model is presented as guaranteed available.
+DARK_PRESETS = {
+    'Normal': 'Gunakan suasana sesuai adegan dan preferensi cerita yang telah ditetapkan.',
+    'Dark Fantasy': 'Bangun fantasi kelam dengan dilema moral, bahaya, pengkhianatan, dan misteri. Hindari kemenangan instan.',
+    'Psychological Horror': 'Bangun ketegangan psikologis melalui ketidakpastian, persepsi, rahasia, dan reaksi NPC yang realistis.',
+    'Survival Horror': 'Tekankan keterbatasan sumber daya, rasa terancam, pilihan sulit, dan peluang bertahan hidup yang masuk akal.',
+    'Gore Fiktif': 'Boleh menggambarkan kekerasan dan akibat luka dalam cerita fiktif sesuai intensitas pilihan, tanpa mengubahnya menjadi instruksi kekerasan dunia nyata.',
+}
+DARK_INTENSITY = {
+    'Ringan': 'Deskripsi kekerasan singkat dan tidak grafis; utamakan atmosfer.',
+    'Sedang': 'Deskripsi luka dan bahaya seperlunya untuk membangun ketegangan; hindari detail berlebihan.',
+    'Intens': 'Boleh lebih gamblang dalam menggambarkan dampak fisik kekerasan fiktif bila relevan; tetap jaga alur, karakter, dan tidak perlu memaksakan adegan ekstrem.',
+}
+
+
+def model_options():
+    # Custom and fetched models share the same internal ID namespace, distinct from built-ins.
+    options = dict(AGENTS)
+    options.update(st.session_state.get('catalog_models', {}))
+    options.update(st.session_state.get('custom_models', {}))
+    return options
+
+
+def model_info(key):
+    return model_options().get(key, {'name': key, 'model': key})
+
+
+def model_label(key):
+    return model_info(key)['name']
+
+
+def catalog_key(model_id):
+    return 'api:' + model_id
+
+
+def extract_model_ids(payload):
+    # Support common OpenAI-compatible model listing shapes; reject malformed entries.
+    rows = payload.get('data', []) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    ids = []
+    for item in rows:
+        value = item if isinstance(item, str) else item.get('id') if isinstance(item, dict) else None
+        if isinstance(value, str) and 0 < len(value) <= 200 and value.strip() == value:
+            ids.append(value)
+    return sorted(set(ids))
+
+
+def refresh_model_catalog():
+    key = api_key()
+    if not key:
+        st.session_state.catalog_status = 'Hubungkan API key terlebih dahulu.'
+        return
+    try:
+        with httpx.Client(timeout=20) as client:
+            response = client.get(f'{BASE_URL}/models', headers={'Authorization': f'Bearer {key}'})
+        if response.status_code != 200:
+            st.session_state.catalog_status = f'Katalog tidak dapat dibaca (HTTP {response.status_code}).'
+            return
+        ids = extract_model_ids(response.json())
+        if not ids:
+            st.session_state.catalog_status = 'Katalog tidak berisi ID model yang dikenali.'
+            return
+        st.session_state.catalog_models = {
+            catalog_key(mid): {'name': mid + ' (katalog)', 'model': mid} for mid in ids
+        }
+        st.session_state.catalog_status = f'{len(ids)} model ditemukan dalam katalog. Ketersediaan pemakaian tetap bergantung pada izin dan kuota.'
+    except (httpx.RequestError, ValueError, TypeError):
+        st.session_state.catalog_status = 'Gagal mengambil katalog model. Periksa koneksi atau coba lagi.'
+
+
+def add_custom_model():
+    model_id = st.session_state.new_model_id.strip()
+    label = st.session_state.new_model_name.strip() or model_id
+    if not model_id or len(model_id) > 200 or any(c.isspace() for c in model_id):
+        st.session_state.catalog_status = 'ID model harus diisi, tanpa spasi, maksimal 200 karakter.'
+        return
+    key = catalog_key(model_id)
+    st.session_state.custom_models[key] = {'name': label, 'model': model_id}
+    st.session_state.catalog_status = f'Model {model_id} ditambahkan ke pilihan. Belum tentu didukung API.'
+    st.session_state.new_model_id = ''
+    st.session_state.new_model_name = ''
+
+
+def remove_custom_model(key):
+    if key in st.session_state.custom_models:
+        del st.session_state.custom_models[key]
+        # Keep any existing history; restore selector to a built-in if needed.
+        if st.session_state.agent == key:
+            st.session_state.agent = 'luna'
+        if st.session_state.compare_agent == key:
+            st.session_state.compare_agent = 'nano'
+
+
+def save_dark_setting(field):
+    """Persist widget changes in keys Streamlit will not garbage-collect."""
+    widget_key = f'{field}_editor'
+    allowed = DARK_PRESETS if field == 'dark_preset' else DARK_INTENSITY
+    candidate = st.session_state.get(widget_key)
+    if candidate in allowed:
+        st.session_state[field] = candidate
+
+
+def restore_dark_widgets():
+    """Rehydrate page-local widget keys from canonical values before rendering."""
+    for field, allowed, fallback in (
+        ('dark_preset', DARK_PRESETS, 'Normal'),
+        ('dark_intensity', DARK_INTENSITY, 'Sedang'),
+    ):
+        canonical = st.session_state.get(field, fallback)
+        if canonical not in allowed:
+            canonical = fallback
+            st.session_state[field] = canonical
+        st.session_state[f'{field}_editor'] = canonical
+
+
+def dark_roleplay_context():
+    if st.session_state.mode != 'Roleplay':
+        return ''
+    return ('[SUASANA ROLEPLAY]\n'
+            + DARK_PRESETS[st.session_state.dark_preset] + '\n'
+            + DARK_INTENSITY[st.session_state.dark_intensity]
+            + '\nKekerasan hanya dalam narasi fiktif; jangan mengubahnya menjadi panduan tindakan berbahaya nyata. '
+              'Jaga kebebasan pemain, batas kemampuan, dan konsekuensi yang logis.')
+
+
 ASSISTANT_PROMPT = 'Kamu adalah asisten AI serbaguna. Jawab dalam bahasa Indonesia dengan jelas, akurat, dan jujur. Jika tidak tahu, katakan dengan jujur.'
 ROLEPLAY_PROMPT = '''Kamu adalah narator dan pengendali NPC dalam roleplay interaktif berbahasa Indonesia.
 Pemain mengendalikan karakter bernama {player}. Jangan menentukan tindakan, dialog, pikiran, perasaan, atau keputusan pemain.
@@ -48,6 +175,8 @@ DEFAULTS = {
     'expression': 'Sedang', 'action_format': 'Miring (Markdown)',
     'messages': [], 'comparisons': [], 'branches': {}, 'compare_mode': False,
     'model_histories': {}, 'pollinations_key': '', 'api_connected': False, 'api_key_input': '', 'api_notice': '',
+    'custom_models': {}, 'catalog_models': {}, 'catalog_status': '', 'new_model_id': '', 'new_model_name': '', 'dark_preset': 'Normal', 'dark_intensity': 'Sedang',
+    'dark_preset_editor': 'Normal', 'dark_intensity_editor': 'Sedang',
     'player_input': 'Arka', 'player_editor': 'Arka', 'action_policy': 'Seimbang', 'drafts_by_mode': {}, 'applied_by_mode': {}, 'compare_agent': 'luna', 'prompt_override': None, 'prompt_editor': '', 'notice': '', 'studio_mode': None, 'studio_fields': {}, 'workspace': '💬 Chat AI',
 }
 for key, value in DEFAULTS.items():
@@ -414,7 +543,7 @@ def connect_api():
             response = client.post(
                 f'{BASE_URL}/chat/completions',
                 headers={'Authorization': f'Bearer {candidate}', 'Content-Type': 'application/json'},
-                json={'model': AGENTS[st.session_state.agent]['model'],
+                json={'model': model_info(st.session_state.agent)['model'],
                       'messages': [{'role': 'user', 'content': 'Jawab hanya: OK'}],
                       'max_tokens': 12, 'stream': False},
             )
@@ -447,7 +576,7 @@ def call_model(model_key, messages):
             response = client.post(
                 f'{BASE_URL}/chat/completions',
                 headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
-                json={'model': AGENTS[model_key]['model'], 'messages': messages, 'stream': False},
+                json={'model': model_info(model_key)['model'], 'messages': messages, 'stream': False},
             )
     except httpx.RequestError as exc:
         raise RuntimeError(f'Koneksi Pollinations gagal: {type(exc).__name__}') from exc
@@ -498,7 +627,7 @@ def payload(history):
     result = []
     system_text = effective_prompt()
     if st.session_state.mode == 'Roleplay':
-        system_text += '\n\n' + action_policy_prompt() + '\n\n' + character_context()
+        system_text += '\n\n' + action_policy_prompt() + '\n\n' + character_context() + '\n\n' + dark_roleplay_context()
     if system_text.strip():
         result.append({'role': 'system', 'content': system_text})
     return result + history[-40:]
@@ -524,7 +653,7 @@ PAGES = [
 
 with st.sidebar:
     st.title('🤖 Nusantara AI Lab')
-    st.caption('Workspace v0.5.9')
+    st.caption('Workspace v0.6.2')
     with st.expander('🔑 Koneksi Pollinations API', expanded=not st.session_state.api_connected):
         if st.session_state.api_connected:
             st.success('🟢 Terhubung')
@@ -542,7 +671,9 @@ with st.sidebar:
     st.divider()
     st.caption('PENGATURAN CEPAT')
     st.selectbox('Mode interaksi', ['Assistant', 'Roleplay'], key='mode', on_change=mode_changed)
-    st.selectbox('Model utama', list(AGENTS), format_func=lambda k: AGENTS[k]['name'],
+    if st.session_state.agent not in model_options():
+        st.session_state.agent = 'luna'
+    st.selectbox('Model utama', list(model_options()), format_func=model_label,
                  key='agent', on_change=model_changed)
     st.button('➕ New Chat', use_container_width=True, on_click=new_chat)
     st.caption('Mengganti menu tidak menghapus chat.')
@@ -553,6 +684,16 @@ page = st.session_state.workspace
 if page == '🧩 Prompt Studio':
     restore_studio_widgets()
     st.title('🧩 Prompt Studio')
+    if st.session_state.mode == 'Roleplay':
+        restore_dark_widgets()
+        with st.expander('🌑 Suasana Dark Roleplay', expanded=False):
+            st.selectbox('Preset cerita', list(DARK_PRESETS), key='dark_preset_editor',
+                         on_change=save_dark_setting, args=('dark_preset',),
+                         help='Preset menambah konteks saat chat; tidak menghapus prompt manual.')
+            st.selectbox('Intensitas deskripsi', list(DARK_INTENSITY), key='dark_intensity_editor',
+                         on_change=save_dark_setting, args=('dark_intensity',))
+            st.caption('Perubahan langsung berlaku untuk pesan berikutnya. Tidak menghapus chat.')
+            st.code(dark_roleplay_context(), language=None)
     st.caption('Buka tiap bagian untuk mengedit. Perubahan teks aktif setelah Terapkan ditekan.')
     if st.session_state.mode == 'Roleplay':
         st.session_state.action_policy_editor = st.session_state.action_policy
@@ -637,8 +778,8 @@ elif page == '🧠 Memori & State':
     st.caption('Inspeksi riwayat saat ini; belum ada memori permanen atau status NPC otomatis.')
     if st.session_state.compare_mode:
         for model, branch in st.session_state.branches.items():
-            st.metric(AGENTS[model]['name'], f'{len(branch)} pesan')
-            with st.expander(f'Riwayat {AGENTS[model]["name"]}'):
+            st.metric(model_label(model), f'{len(branch)} pesan')
+            with st.expander(f'Riwayat {model_label(model)}'):
                 st.json(branch)
     else:
         st.metric('Jumlah pesan model aktif', len(current_history(st.session_state.agent)))
@@ -648,19 +789,39 @@ elif page == '🧠 Memori & State':
 
 elif page == '⚖️ Model Lab':
     st.title('⚖️ Model Lab')
-    st.caption('Konfigurasi perbandingan. Jalankan percakapan pada menu Chat AI.')
+    st.caption('Konfigurasi perbandingan dan pengelolaan model. Jalankan percakapan pada menu Chat AI.')
+    with st.expander('🧩 Model Manager — Katalog Pollinations & Model Kustom', expanded=True):
+        st.button('🔄 Ambil katalog model dari Pollinations', on_click=refresh_model_catalog,
+                  disabled=not bool(api_key()))
+        if st.session_state.catalog_status:
+            st.info(st.session_state.catalog_status)
+        st.caption('Daftar dari API tidak menjamin semua model tersedia pada akun atau kuota Anda.')
+        st.text_input('ID model kustom', key='new_model_id',
+                      placeholder='Contoh: mistralai/mistral-large-3')
+        st.text_input('Nama tampilan (opsional)', key='new_model_name',
+                      placeholder='Contoh: Mistral Large 3')
+        st.button('➕ Tambahkan model', on_click=add_custom_model)
+        if st.session_state.custom_models:
+            st.caption('Model yang Anda tambahkan:')
+            for mk, mi in list(st.session_state.custom_models.items()):
+                left, right = st.columns([4, 1])
+                left.caption(f"{mi['name']} — {mi['model']}")
+                right.button('Hapus', key='remove_' + mk, on_click=remove_custom_model, args=(mk,))
+        st.caption('Setelah menambahkan model, pilih melalui Model utama di sidebar atau Model pembanding di bawah.')
     if not api_key():
         st.info('Hubungkan API Pollinations di sidebar untuk menjalankan perbandingan model.')
     st.checkbox('Bandingkan dua model', key='compare_mode', on_change=model_changed)
     if st.session_state.compare_mode:
-        st.selectbox('Model pembanding', list(AGENTS),
-                     format_func=lambda k: AGENTS[k]['name'], key='compare_agent',
+        if st.session_state.compare_agent not in model_options():
+            st.session_state.compare_agent = 'nano'
+        st.selectbox('Model pembanding', list(model_options()),
+                     format_func=model_label, key='compare_agent',
                      on_change=model_changed)
         if st.session_state.agent == st.session_state.compare_agent:
             st.warning('Pilih model pembanding yang berbeda dari model utama.')
         else:
-            st.success(f"Model utama: {AGENTS[st.session_state.agent]['name']} | "
-                       f"Pembanding: {AGENTS[st.session_state.compare_agent]['name']}")
+            st.success(f"Model utama: {model_label(st.session_state.agent)} | "
+                       f"Pembanding: {model_label(st.session_state.compare_agent)}")
     st.metric('Giliran perbandingan', len(st.session_state.comparisons))
     st.button('Buka Chat AI', on_click=navigate_to, args=('💬 Chat AI',))
 
@@ -673,7 +834,7 @@ elif page == '📁 Sesi & Data':
 
 elif page == '💬 Chat AI':
     st.title('💬 Chat AI')
-    st.caption(f"Mode: {st.session_state.mode} | Model: {AGENTS[st.session_state.agent]['name']}")
+    st.caption(f"Mode: {st.session_state.mode} | Model: {model_label(st.session_state.agent)}")
     if st.session_state.mode == 'Roleplay':
         st.caption(f"Pemain: {st.session_state.player} | Gaya: {st.session_state.style} | Validasi: {st.session_state.action_policy}")
         focus_options = ['Otomatis (sesuai adegan)'] + [n['name'].strip() for n in st.session_state.npc_profiles if n.get('name', '').strip()]
@@ -704,7 +865,7 @@ elif page == '💬 Chat AI':
                 (right, item['secondary'], 'secondary_answer', 'secondary_error'),
             ):
                 with column:
-                    st.markdown(f"**{AGENTS[model]['name']}**")
+                    st.markdown(f"**{model_label(model)}**")
                     if item[answer_key] is not None:
                         render_message(item[answer_key])
                     else:
@@ -716,6 +877,61 @@ elif page == '💬 Chat AI':
         for item in current_history(st.session_state.agent):
             with st.chat_message(item['role']):
                 render_message(item['content'])
+
+    # One click = one continuation. No background loop or automatic repeated API calls.
+    # A continuation is stored as a user instruction so the next turn retains context.
+    can_continue = bool(api_key()) and (not st.session_state.compare_mode or valid_comparison)
+    if valid_comparison:
+        has_scene = bool(current_history(primary) or current_history(secondary))
+    else:
+        has_scene = bool(current_history(st.session_state.agent))
+    continue_clicked = st.button(
+        '▶️ Lanjutkan adegan' if st.session_state.mode == 'Roleplay' else '▶️ Lanjutkan jawaban',
+        key='continue_scene_button',
+        disabled=not (can_continue and has_scene),
+        help='Minta model meneruskan cerita satu giliran tanpa menentukan tindakan pemain. '
+             'Dalam mode perbandingan, kedua model melanjutkan riwayat masing-masing.',
+    )
+    if continue_clicked:
+        if st.session_state.mode == 'Roleplay':
+            continuation = (
+                '[PERINTAH LANJUTAN NARATOR] Lanjutkan adegan secara alami dari situasi terakhir. '
+                'Gerakkan waktu, lingkungan, kejadian, dan NPC sesuai motivasi serta keadaan mereka. '
+                'Jaga suasana, konsistensi karakter, aturan dunia, dan konsekuensi sebelumnya. '
+                'Jangan menentukan ucapan, keputusan, kemampuan baru, atau tindakan penting '
+                'atas nama karakter pemain. Jangan menyelesaikan konflik secara mendadak. '
+                'Berikan perkembangan yang bermakna lalu sisakan ruang bagi respons pemain. '
+                'Ini adalah instruksi aplikasi, bukan ucapan atau tindakan karakter pemain.'
+            )
+        else:
+            continuation = 'Lanjutkan jawaban terakhir dari bagian yang belum selesai tanpa mengulanginya.'
+        continuation_message = {'role': 'user', 'content': continuation}
+        if valid_comparison:
+            answers, errors = {}, {}
+            with st.spinner('Kedua model melanjutkan adegan...'):
+                for model in (primary, secondary):
+                    branch = current_history(model)
+                    try:
+                        answer = call_model(model, payload(branch + [continuation_message]))
+                        branch.extend([continuation_message.copy(), {'role': 'assistant', 'content': answer}])
+                        answers[model] = answer
+                    except RuntimeError as exc:
+                        answers[model] = None
+                        errors[model] = str(exc)
+            st.session_state.comparisons.append({
+                'prompt': '▶️ Lanjutkan adegan', 'primary': primary, 'secondary': secondary,
+                'primary_answer': answers[primary], 'secondary_answer': answers[secondary],
+                'primary_error': errors.get(primary), 'secondary_error': errors.get(secondary),
+            })
+        else:
+            branch = current_history(st.session_state.agent)
+            with st.spinner('Model melanjutkan adegan...'):
+                try:
+                    answer = call_model(st.session_state.agent, payload(branch + [continuation_message]))
+                    branch.extend([continuation_message, {'role': 'assistant', 'content': answer}])
+                except RuntimeError as exc:
+                    st.error(f'Gagal melanjutkan: {exc}. Anda dapat mencoba lagi.')
+        st.rerun()
 
     prompt = st.chat_input('Ketik pesan atau tindakan roleplay...',
                            disabled=(not api_key()) or (st.session_state.compare_mode and not valid_comparison))
@@ -753,21 +969,22 @@ elif page == '💬 Chat AI':
                         st.info('Pesan gagal dikirim. Silakan kirim kembali.')
 
 export = {
-    'app': 'Nusantara AI Lab v0.5.9', 'exported_at': datetime.now(timezone.utc).isoformat(),
-    'mode': st.session_state.mode, 'agent': AGENTS[st.session_state.agent]['model'],
+    'app': 'Nusantara AI Lab v0.6.2', 'exported_at': datetime.now(timezone.utc).isoformat(),
+    'mode': st.session_state.mode, 'agent': model_info(st.session_state.agent)['model'],
     'compare_mode': st.session_state.compare_mode,
-    'compare_agent': AGENTS[st.session_state.compare_agent]['model'] if st.session_state.compare_mode else None,
+    'compare_agent': model_info(st.session_state.compare_agent)['model'] if st.session_state.compare_mode else None,
     'player': st.session_state.player if st.session_state.mode == 'Roleplay' else None,
     'style': st.session_state.style, 'expression': st.session_state.expression,
-    'action_format': st.session_state.action_format, 'action_policy': st.session_state.action_policy, 'system_prompt': effective_prompt(),
+    'action_format': st.session_state.action_format, 'action_policy': st.session_state.action_policy, 'dark_preset': st.session_state.dark_preset, 'dark_intensity': st.session_state.dark_intensity, 'system_prompt': effective_prompt(),
     'messages': current_history(st.session_state.agent), 'model_histories': st.session_state.model_histories, 'comparisons': st.session_state.comparisons,
-    'branches': {AGENTS[k]['model']: v for k, v in st.session_state.branches.items()},
+    'branches': {model_info(k)['model']: v for k, v in st.session_state.branches.items()},
     'prompt_sections': dict(st.session_state.studio_fields),
     'player_profile': dict(st.session_state.player_profile),
     'npc_profiles': [dict(n) for n in st.session_state.npc_profiles],
+    'custom_model_ids': [v['model'] for v in st.session_state.custom_models.values()],
 }
 if page == '📁 Sesi & Data':
     st.download_button('⬇️ Ekspor percakapan JSON',
                        data=json.dumps(export, ensure_ascii=False, indent=2),
-                       file_name='nusantara_ai_lab_v059_export.json',
+                       file_name='nusantara_ai_lab_v062_export.json',
                        mime='application/json', use_container_width=True)
